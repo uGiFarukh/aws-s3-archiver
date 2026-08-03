@@ -1,4 +1,4 @@
-"""ZIP-compress objects as they arrive in an S3 bucket.
+"""Compress objects that arrive in an S3 bucket into ZIP archives.
 
 This module is the entry point of a Lambda function invoked by
 ``s3:ObjectCreated:*`` notifications. For every record in the event it
@@ -15,17 +15,15 @@ Environment variables
 ---------------------
 SOURCE_PREFIX
     Key prefix the S3 notification is filtered on. Keys outside it are
-    ignored.
+    ignored. Defaults to ``incoming/``.
 ARCHIVE_PREFIX
     Key prefix the archives are written to. It must not sit inside
-    ``SOURCE_PREFIX``.
+    ``SOURCE_PREFIX``. Defaults to ``archive/``.
 COMPRESSION_LEVEL
     DEFLATE level from 0 (store only) to 9 (smallest). Defaults to 6.
 LOG_LEVEL
     Standard logging level name. Defaults to ``INFO``.
 """
-
-from __future__ import annotations
 
 import logging
 import os
@@ -39,21 +37,9 @@ import boto3
 LOGGER = logging.getLogger()
 LOGGER.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
 
-SOURCE_PREFIX = os.environ["SOURCE_PREFIX"]
-ARCHIVE_PREFIX = os.environ["ARCHIVE_PREFIX"]
+SOURCE_PREFIX = os.environ.get("SOURCE_PREFIX", "incoming/")
+ARCHIVE_PREFIX = os.environ.get("ARCHIVE_PREFIX", "archive/")
 COMPRESSION_LEVEL = int(os.environ.get("COMPRESSION_LEVEL", "6"))
-
-#: Number of bytes read from S3 and fed into the compressor at a time.
-#: Streaming in chunks keeps memory use independent of object size.
-CHUNK_SIZE = 1024 * 1024
-
-#: Archives smaller than this are held in memory; larger ones spill to
-#: the function's ephemeral disk instead of growing the heap.
-SPOOL_MAX_BYTES = 32 * 1024 * 1024
-
-#: Created at import time so that the connection pool is reused by
-#: every invocation served by the same execution environment.
-S3_CLIENT = boto3.client("s3")
 
 if ARCHIVE_PREFIX.startswith(SOURCE_PREFIX) or SOURCE_PREFIX.startswith(
     ARCHIVE_PREFIX
@@ -63,6 +49,31 @@ if ARCHIVE_PREFIX.startswith(SOURCE_PREFIX) or SOURCE_PREFIX.startswith(
         "function compress its own output in a loop: "
         f"{SOURCE_PREFIX!r} and {ARCHIVE_PREFIX!r}"
     )
+
+#: Number of bytes read from S3 and fed into the compressor at a time.
+#: Streaming in chunks keeps memory use independent of object size.
+CHUNK_SIZE = 1024 * 1024
+
+#: Archives smaller than this are held in memory; larger ones spill to
+#: the function's ephemeral disk instead of growing the heap.
+SPOOL_MAX_BYTES = 32 * 1024 * 1024
+
+#: Cached S3 client. It is built on first use rather than at import, so
+#: that the module can be imported without AWS credentials, and is then
+#: reused by every invocation served by the same execution environment.
+_S3_CLIENT = None
+
+
+def get_s3_client() -> Any:
+    """Return the S3 client, creating it on first use.
+
+    Returns:
+        The cached boto3 S3 client for this execution environment.
+    """
+    global _S3_CLIENT
+    if _S3_CLIENT is None:
+        _S3_CLIENT = boto3.client("s3")
+    return _S3_CLIENT
 
 
 def build_archive_key(source_key: str) -> str:
@@ -121,37 +132,43 @@ def archive_object(bucket: str, key: str) -> str | None:
         object was outside the source prefix and was skipped.
     """
     if not key.startswith(SOURCE_PREFIX):
-        LOGGER.warning("skipping key outside the source prefix: %s", key)
+        LOGGER.warning("Skipping key outside the source prefix: %s", key)
         return None
 
+    s3_client = get_s3_client()
     archive_key = build_archive_key(key)
     entry_name = key[len(SOURCE_PREFIX):]
 
-    source = S3_CLIENT.get_object(Bucket=bucket, Key=key)
+    source = s3_client.get_object(Bucket=bucket, Key=key)
     with source["Body"] as body:
         archive_file = compress_to_archive(body, entry_name)
 
     with archive_file:
-        S3_CLIENT.upload_fileobj(archive_file, bucket, archive_key)
+        s3_client.upload_fileobj(archive_file, bucket, archive_key)
 
-    S3_CLIENT.delete_object(Bucket=bucket, Key=key)
-    LOGGER.info("archived s3://%s/%s to %s", bucket, key, archive_key)
+    s3_client.delete_object(Bucket=bucket, Key=key)
+    LOGGER.info("Archived s3://%s/%s to %s", bucket, key, archive_key)
     return archive_key
 
 
 def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     """Handle an S3 ``ObjectCreated`` notification.
 
+    Parameters
+    ----------
+    event: dict, required
+        S3 Event Notification Format
+
+    context: object, required
+        Lambda Context runtime methods and attributes
+
+    Returns
+    ------
+    dict: the archive keys written by this invocation.
+
     Exceptions are logged and re-raised rather than ignored. Failing
     the invocation lets Lambda retry it, and leaves the source object
     in place until an attempt succeeds.
-
-    Args:
-        event: S3 event notification payload.
-        context: Lambda runtime context. Unused.
-
-    Returns:
-        A summary of the keys that were archived.
     """
     archived: list[str] = []
 
@@ -162,7 +179,7 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         try:
             archive_key = archive_object(bucket, key)
         except Exception:
-            LOGGER.exception("failed to archive s3://%s/%s", bucket, key)
+            LOGGER.exception("Failed to archive s3://%s/%s", bucket, key)
             raise
         if archive_key is not None:
             archived.append(archive_key)
