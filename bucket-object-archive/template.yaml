@@ -3,41 +3,299 @@ Transform: AWS::Serverless-2016-10-31
 Description: >
   python3.14
 
-  Sample SAM Template for bucket-object-archive
+  Compresses every new object in an S3 bucket into a ZIP archive, writes
+  the archive back to the same bucket under a separate prefix, and
+  deletes the original object. The bucket, the VPC the function runs in
+  and the function itself are all created by this stack.
 
-# More info about Globals: https://github.com/awslabs/serverless-application-model/blob/master/docs/globals.rst
+# The function, its role and its environment never use !Ref or !GetAtt
+# on the bucket. A bucket whose notification points at a function whose
+# role points back at the bucket is a circular dependency that
+# CloudFormation cannot resolve. The bucket name is therefore derived
+# from the stack name and rebuilt with !Sub wherever it is needed.
+
 Globals:
   Function:
-    Timeout: 3
+    Timeout: 60
+    MemorySize: 1024
+
+Parameters:
+  ImageTag:
+    Type: String
+    Default: local
+    Description: >
+      Identifier written into the Lambda version description, normally
+      the Git commit SHA, so a deployed version can be traced back to a
+      commit. Pass it on deploy:
+      sam deploy --parameter-overrides ImageTag=$(git rev-parse --short HEAD)
+
+  VpcCidr:
+    Type: String
+    Default: 10.40.0.0/16
+    Description: CIDR block of the VPC that hosts the function.
+
+  PrivateSubnet1Cidr:
+    Type: String
+    Default: 10.40.0.0/20
+    Description: Private subnet in the first availability zone.
+
+  PrivateSubnet2Cidr:
+    Type: String
+    Default: 10.40.16.0/20
+    Description: Private subnet in the second availability zone.
+
+  SourcePrefix:
+    Type: String
+    Default: incoming/
+    AllowedPattern: "^[^/].*/$"
+    Description: Prefix new objects are uploaded to.
+
+  ArchivePrefix:
+    Type: String
+    Default: archive/
+    AllowedPattern: "^[^/].*/$"
+    Description: >
+      Prefix the archives are written to. It must not sit inside
+      SourcePrefix, or each archive would trigger the function again.
+
+  CompressionLevel:
+    Type: Number
+    Default: 6
+    MinValue: 0
+    MaxValue: 9
+    Description: DEFLATE level, 0 (store) to 9 (smallest).
+
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+    Description: Retention of the function's CloudWatch log group.
 
 Resources:
-  HelloWorldFunction:
-    Type: AWS::Serverless::Function # More info about Function Resource: https://github.com/awslabs/serverless-application-model/blob/master/versions/2016-10-31.md#awsserverlessfunction
+  # ---------------------------------------------------------------
+  # Networking. The VPC has no internet gateway and no NAT gateway, so
+  # the only route out of the private subnets is the S3 gateway
+  # endpoint below, which carries no hourly or per-GB charge.
+  # ---------------------------------------------------------------
+  Vpc:
+    Type: AWS::EC2::VPC
     Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-vpc"
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PrivateSubnet1Cidr
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-private-1"
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PrivateSubnet2Cidr
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-private-2"
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-private"
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.s3"
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref PrivateRouteTable
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: "*"
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+              - s3:DeleteObject
+              - s3:AbortMultipartUpload
+            Resource: !Sub "arn:${AWS::Partition}:s3:::${AWS::StackName}-${AWS::AccountId}-${AWS::Region}/*"
+            Condition:
+              StringEquals:
+                aws:PrincipalAccount: !Ref AWS::AccountId
+
+  FunctionSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Egress-only group for the object compress function.
+      VpcId: !Ref Vpc
+      # The VPC has no internet gateway, so the only destination this
+      # rule can actually reach is the S3 gateway endpoint.
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS to S3 through the gateway endpoint.
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-function"
+
+  # ---------------------------------------------------------------
+  # Storage
+  # ---------------------------------------------------------------
+  DataBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-${AWS::AccountId}-${AWS::Region}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+
+  DataBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DataBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyUnencryptedTransport
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource:
+              - !GetAtt DataBucket.Arn
+              - !Sub "${DataBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+
+  # ---------------------------------------------------------------
+  # Compute
+  # ---------------------------------------------------------------
+  ObjectCompressLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-object-compress"
+      RetentionInDays: !Ref LogRetentionDays
+
+  ObjectCompressFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: ObjectCompressLogGroup
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-object-compress"
+      Description: Compresses new S3 objects into ZIP archives.
       PackageType: Image
       Architectures:
         - arm64
+
+      # AutoPublishAlias publishes an immutable version on every
+      # deployment and moves the "live" alias to it, so any previous
+      # release can be restored by repointing the alias rather than
+      # rebuilding. AllProperties extends that to configuration-only
+      # changes, which would otherwise reuse the existing version.
+      AutoPublishAlias: live
+      AutoPublishAliasAllProperties: true
+      VersionDescription: !Sub "image=${ImageTag}"
+
+      VpcConfig:
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+        SecurityGroupIds:
+          - !Ref FunctionSecurityGroup
+
+      Environment:
+        Variables:
+          SOURCE_PREFIX: !Ref SourcePrefix
+          ARCHIVE_PREFIX: !Ref ArchivePrefix
+          COMPRESSION_LEVEL: !Ref CompressionLevel
+
+      Policies:
+        - AWSLambdaVPCAccessExecutionRole
+        - Version: "2012-10-17"
+          Statement:
+            - Sid: ReadAndDeleteSourceObjects
+              Effect: Allow
+              Action:
+                - s3:GetObject
+                - s3:DeleteObject
+              Resource: !Sub "arn:${AWS::Partition}:s3:::${AWS::StackName}-${AWS::AccountId}-${AWS::Region}/${SourcePrefix}*"
+            - Sid: WriteArchives
+              Effect: Allow
+              Action:
+                - s3:PutObject
+                - s3:AbortMultipartUpload
+              Resource: !Sub "arn:${AWS::Partition}:s3:::${AWS::StackName}-${AWS::AccountId}-${AWS::Region}/${ArchivePrefix}*"
+
       Events:
-        HelloWorld:
-          Type: Api # More info about API Event Source: https://github.com/awslabs/serverless-application-model/blob/master/versions/2016-10-31.md#api
+        ObjectCreated:
+          Type: S3
           Properties:
-            Path: /hello
-            Method: get
+            Bucket: !Ref DataBucket
+            Events: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: !Ref SourcePrefix
     Metadata:
       Dockerfile: Dockerfile
-      DockerContext: ./hello_world
+      DockerContext: ./object_compress
       DockerTag: python3.14-v1
 
 Outputs:
-  # ServerlessRestApi is an implicit API created out of Events key under Serverless::Function
-  # Find out more about other implicit resources you can reference within SAM
-  # https://github.com/awslabs/serverless-application-model/blob/master/docs/internals/generated_resources.rst#api
-  HelloWorldApi:
-    Description: "API Gateway endpoint URL for Prod stage for Hello World function"
-    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/Prod/hello/"
-  HelloWorldFunction:
-    Description: "Hello World Lambda Function ARN"
-    Value: !GetAtt HelloWorldFunction.Arn
-  HelloWorldFunctionIamRole:
-    Description: "Implicit IAM Role created for Hello World function"
-    Value: !GetAtt HelloWorldFunctionRole.Arn
+  DataBucketName:
+    Description: "Bucket that objects are uploaded to and archived in"
+    Value: !Ref DataBucket
+  ObjectCompressFunction:
+    Description: "Object Compress Lambda Function ARN"
+    Value: !GetAtt ObjectCompressFunction.Arn
+  ObjectCompressFunctionAlias:
+    Description: "Alias the S3 notification invokes. Repoint it to roll back"
+    Value: !Ref ObjectCompressFunction.Alias
+  ObjectCompressFunctionIamRole:
+    Description: "Implicit IAM Role created for Object Compress function"
+    Value: !GetAtt ObjectCompressFunctionRole.Arn
+  VpcId:
+    Description: "VPC hosting the function's private subnets"
+    Value: !Ref Vpc
