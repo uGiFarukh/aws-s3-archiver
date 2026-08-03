@@ -1,1 +1,4 @@
-requests
+# The base image already ships a boto3, but pinning it here means the
+# version is decided by this repository rather than by whenever the
+# image was last rebuilt.
+boto3>=1.43,<2.0
