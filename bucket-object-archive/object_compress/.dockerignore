@@ -1,0 +1,40 @@
+# Python bytecode. The image compiles its own during the build, and a
+# local __pycache__ changes the context checksum, which busts the Docker
+# layer cache for no reason.
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Local virtualenvs, in case one is ever created next to the source.
+.venv/
+venv/
+env/
+
+# Test and tooling caches.
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# SAM and IDE artefacts.
+.aws-sam/
+.idea/
+.vscode/
+*.iml
+
+# OS noise.
+.DS_Store
+Thumbs.db
+*~
+
+# Secrets must never enter an image layer.
+.env
+.env.*
+*.pem
+*.key
+
+# Not needed inside the image.
+Dockerfile
+.dockerignore
