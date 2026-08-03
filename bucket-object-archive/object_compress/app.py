@@ -135,6 +135,15 @@ def archive_object(bucket: str, key: str) -> str | None:
         LOGGER.warning("Skipping key outside the source prefix: %s", key)
         return None
 
+    # Creating a folder in the S3 console creates a real zero-byte
+    # object whose key ends in "/". It matches the notification filter
+    # like any other object, so it has to be skipped explicitly or the
+    # function archives the placeholder and then deletes it, making the
+    # folder disappear from the console.
+    if key.endswith("/"):
+        LOGGER.info("Skipping folder placeholder: %s", key)
+        return None
+
     s3_client = get_s3_client()
     archive_key = build_archive_key(key)
     entry_name = key[len(SOURCE_PREFIX):]

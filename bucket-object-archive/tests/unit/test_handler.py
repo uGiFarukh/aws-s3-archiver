@@ -138,6 +138,23 @@ def test_key_outside_the_source_prefix_is_skipped(s3_client):
     assert s3_client.calls == []
 
 
+@pytest.mark.parametrize(
+    "folder_key", ["incoming/", "incoming/2026/", "incoming/2026/08/"]
+)
+def test_folder_placeholders_are_skipped(folder_key, s3_client):
+    """A console-created folder must not be archived or deleted.
+
+    S3 stores it as a real zero-byte object under the watched prefix,
+    so without an explicit guard the function writes archive/.zip and
+    then deletes the folder out from under the console.
+    """
+    s3_client.objects[(BUCKET, folder_key)] = b""
+
+    assert app.archive_object(BUCKET, folder_key) is None
+    assert s3_client.calls == []
+    assert (BUCKET, folder_key) in s3_client.objects
+
+
 def test_original_is_kept_when_the_upload_fails(s3_event, monkeypatch):
     """A failed upload must not delete the only copy of the object."""
     client = FakeS3Client(fail_upload=True)
