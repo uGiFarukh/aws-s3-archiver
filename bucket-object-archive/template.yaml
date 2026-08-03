@@ -226,7 +226,7 @@ Resources:
       Description: Compresses new S3 objects into ZIP archives.
       PackageType: Image
       Architectures:
-        - arm64
+        - x86_64
 
       # AutoPublishAlias publishes an immutable version on every
       # deployment and moves the "live" alias to it, so any previous
